@@ -2,213 +2,162 @@
 #include <stdlib.h>
 #include <math.h>
 
+// Include the STB image libraries for reading/writing PNG files
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
 // ---------------------------------------------------------
-// Macros & Hyperparameters
+// GPU Function: Basic Bilateral Filter
 // ---------------------------------------------------------
-#define TILE_DIM 16
-#define FILTER_RADIUS 3
-#define HALO_DIM (TILE_DIM + 2 * FILTER_RADIUS)
+// This function runs on the graphics card. Each thread calculates exactly ONE pixel.
+__global__ void gpu_bilateral_basic(const float* input, float* output, int width, int height, float sigma_s, float sigma_r) {
+    
+    // 1. Find out which pixel this specific thread is supposed to process
+    int x = blockIdx.x * blockDim.x + threadIdx.x; // The column (X coordinate)
+    int y = blockIdx.y * blockDim.y + threadIdx.y; // The row (Y coordinate)
 
-// Robust CUDA Error Checking Macro
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA Fatal Error at %s:%d - code=%d(%s)\n", \
-                __FILE__, __LINE__, err, cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while (0)
-
-// Constant memory for O(1) spatial weight broadcasts
-__constant__ float c_spatial_kernel[(2 * FILTER_RADIUS + 1) * (2 * FILTER_RADIUS + 1)];
-
-// ---------------------------------------------------------
-// Device: CUDA Bilateral Filter with Shared Memory Tiling
-// ---------------------------------------------------------
-__global__ void gpu_bilateral_shared(const float* input, float* output, int width, int height, float sigma_r) {
-    // Allocate the L1 cache tile
-    __shared__ float s_tile[HALO_DIM][HALO_DIM];
-
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int bx = blockIdx.x * TILE_DIM;
-    int by = blockIdx.y * TILE_DIM;
-
-    int x = bx + tx;
-    int y = by + ty;
-
-    // Phase 1: Collaborative 1D Strided Halo Loading
-    int shared_size = HALO_DIM * HALO_DIM;
-    int tid = ty * TILE_DIM + tx; 
-    int block_size = TILE_DIM * TILE_DIM;
-
-    for (int i = tid; i < shared_size; i += block_size) {
-        int s_row = i / HALO_DIM;
-        int s_col = i % HALO_DIM;
-        
-        int g_row = by - FILTER_RADIUS + s_row;
-        int g_col = bx - FILTER_RADIUS + s_col;
-
-        // Boundary Clamping to prevent segfaults
-        g_row = max(0, min(g_row, height - 1));
-        g_col = max(0, min(g_col, width - 1));
-
-        s_tile[s_row][s_col] = input[g_row * width + g_col];
+    // 2. Stop the thread if it falls outside the actual image boundaries
+    // (This happens because we launch threads in blocks of 16x16)
+    if (x >= width || y >= height) {
+        return; 
     }
 
-    // Hardware barrier: Guarantee all L1 reads are complete
-    __syncthreads();
+    // 3. Read the center pixel's color value from the global GPU memory
+    float center_color = input[y * width + x];
+    
+    float final_pixel_value = 0.0f; // This will hold our blurred result
+    float total_weight = 0.0f;      // We use this to divide at the end so it doesn't get too bright
 
-    // Phase 2: Non-Linear Convolution
-    if (x < width && y < height) {
-        float i_center = s_tile[ty + FILTER_RADIUS][tx + FILTER_RADIUS];
-        float filtered_pixel = 0.0f;
-        float w_p = 0.0f;
-        int spatial_idx = 0;
+    // 4. Look at the surrounding 7x7 grid (3 pixels in every direction)
+    int radius = 3;
+    
+    for (int row_offset = -radius; row_offset <= radius; row_offset++) {
+        for (int col_offset = -radius; col_offset <= radius; col_offset++) {
+            
+            // Calculate the exact X and Y coordinate of the neighbor we are looking at
+            int neighbor_x = x + col_offset;
+            int neighbor_y = y + row_offset;
 
-        // Hoist the constant division out of the O(r^2) loops
-        float sigma_r_coeff = -1.0f / (2.0f * sigma_r * sigma_r);
+            // 5. Make sure the neighbor is actually inside the picture!
+            // If we are at the edge of the image, we don't want to read outside of it.
+            if (neighbor_x >= 0 && neighbor_x < width && neighbor_y >= 0 && neighbor_y < height) {
+                
+                // Read the neighbor's color from global GPU memory
+                float neighbor_color = input[neighbor_y * width + neighbor_x];
 
-        for (int row = -FILTER_RADIUS; row <= FILTER_RADIUS; ++row) {
-            for (int col = -FILTER_RADIUS; col <= FILTER_RADIUS; ++col) {
-                float i_neighbor = s_tile[ty + FILTER_RADIUS + row][tx + FILTER_RADIUS + col];
-                
-                // Photometric range weight calculation (Optimized)
-                float diff = i_center - i_neighbor;
-                float range_weight = expf((diff * diff) * sigma_r_coeff);
-                
-                // Fetch O(1) spatial weight
-                float spatial_weight = c_spatial_kernel[spatial_idx++];
-                
+                // 6. Calculate Spatial Weight (How far away is it physically?)
+                // The further away it is, the lower the weight.
+                float distance_squared = (row_offset * row_offset) + (col_offset * col_offset);
+                float spatial_weight = expf(-distance_squared / (2.0f * sigma_s * sigma_s));
+
+                // 7. Calculate Range Weight (How different is the color?)
+                // If the color is very different (like an edge), the weight becomes almost zero.
+                float color_diff = center_color - neighbor_color;
+                float color_diff_squared = color_diff * color_diff;
+                float range_weight = expf(-color_diff_squared / (2.0f * sigma_r * sigma_r));
+
+                // 8. Multiply the two weights together to get the final importance of this neighbor
                 float combined_weight = spatial_weight * range_weight;
-                filtered_pixel += i_neighbor * combined_weight;
-                w_p += combined_weight;
+
+                // Add the neighbor's color (scaled by its importance) to our running total
+                final_pixel_value += neighbor_color * combined_weight;
+                total_weight += combined_weight; // Keep track of the total weight used
             }
         }
-        output[y * width + x] = filtered_pixel / w_p;
     }
+
+    // 9. Normalize the final pixel (divide by total weight) and save it to the output array
+    output[y * width + x] = final_pixel_value / total_weight;
 }
 
 // ---------------------------------------------------------
-// Host: Precompute Spatial Kernel
-// ---------------------------------------------------------
-void precompute_spatial_kernel(float sigma_s) {
-    int kernel_size = 2 * FILTER_RADIUS + 1;
-    float* h_kernel = (float*)malloc(kernel_size * kernel_size * sizeof(float));
-    
-    if (!h_kernel) {
-        fprintf(stderr, "Fatal: Failed to allocate host memory for spatial kernel.\n");
-        exit(EXIT_FAILURE);
-    }
-
-    int idx = 0;
-    for (int row = -FILTER_RADIUS; row <= FILTER_RADIUS; ++row) {
-        for (int col = -FILTER_RADIUS; col <= FILTER_RADIUS; ++col) {
-            h_kernel[idx++] = expf(-(float)(row * row + col * col) / (2.0f * sigma_s * sigma_s));
-        }
-    }
-    
-    // Transfer directly to symbol in constant memory
-    CUDA_CHECK(cudaMemcpyToSymbol(c_spatial_kernel, h_kernel, kernel_size * kernel_size * sizeof(float)));
-    free(h_kernel);
-}
-
-// ---------------------------------------------------------
-// Application Logic
+// Main Program (Runs on the CPU)
 // ---------------------------------------------------------
 int main(int argc, char** argv) {
+    
+    // Make sure the user provided an image file
     if (argc < 2) {
-        printf("Usage: %s <input_image.png>\n", argv[0]);
+        printf("Usage: ./bilateral_filter <image.png>\n");
         return -1;
     }
 
+    // 1. Load the image from the hard drive
     int width, height, channels;
-    // Force 1-channel grayscale load
     unsigned char* raw_img = stbi_load(argv[1], &width, &height, &channels, 1);
-    if (!raw_img) {
-        fprintf(stderr, "Fatal: Error decoding image from disk.\n");
+    
+    if (raw_img == NULL) {
+        printf("Failed to load the image.\n");
         return -1;
     }
 
-    // Cast dimensions to size_t to prevent 32-bit integer overflow on massive arrays
-    size_t num_pixels = (size_t)width * (size_t)height;
-    size_t bytes = num_pixels * sizeof(float);
+    // Calculate how much memory we need
+    int total_pixels = width * height;
+    int memory_size = total_pixels * sizeof(float);
 
-    // Host allocations with safety checks
-    float* h_input = (float*)malloc(bytes);
-    float* h_output = (float*)malloc(bytes);
-    if (!h_input || !h_output) {
-        fprintf(stderr, "Fatal: Host memory allocation failed.\n");
-        stbi_image_free(raw_img);
-        return -1;
+    // Allocate memory on the CPU
+    float* cpu_input = (float*)malloc(memory_size);
+    float* cpu_output = (float*)malloc(memory_size);
+
+    // Convert the image pixels from integers (0-255) to floats (0.0 to 1.0)
+    for (int i = 0; i < total_pixels; i++) {
+        cpu_input[i] = (float)raw_img[i] / 255.0f;
     }
 
-    // Normalize uint8_t to 32-bit floats [0.0f, 1.0f]
-    for (size_t i = 0; i < num_pixels; i++) {
-        h_input[i] = (float)raw_img[i] / 255.0f;
+    // Setup our filter strengths
+    float sigma_s = 50.0f; // Spatial blur strength
+    float sigma_r = 0.1f;  // Color edge-preservation strength
+
+    // 2. Allocate memory on the GPU
+    float *gpu_input, *gpu_output;
+    cudaMalloc((void**)&gpu_input, memory_size);
+    cudaMalloc((void**)&gpu_output, memory_size);
+
+    // Copy the image from the CPU to the GPU
+    cudaMemcpy(gpu_input, cpu_input, memory_size, cudaMemcpyHostToDevice);
+
+    // 3. Setup the GPU execution grid (Divide the image into 16x16 blocks)
+    int threads_per_block = 16;
+    dim3 blockDim(threads_per_block, threads_per_block);
+    
+    // Calculate how many blocks we need to cover the entire width and height
+    dim3 gridDim((width + threads_per_block - 1) / threads_per_block, 
+                 (height + threads_per_block - 1) / threads_per_block);
+
+    // 4. Run the function on the GPU
+    gpu_bilateral_basic<<<gridDim, blockDim>>>(gpu_input, gpu_output, width, height, sigma_s, sigma_r);
+    
+    // Wait for the GPU to finish all its work
+    cudaDeviceSynchronize();
+
+    // Copy the finished image back from the GPU to the CPU
+    cudaMemcpy(cpu_output, gpu_output, memory_size, cudaMemcpyDeviceToHost);
+
+    // 5. Convert the pixels back from floats (0.0 to 1.0) to integers (0-255)
+    unsigned char* final_image = (unsigned char*)malloc(total_pixels);
+    
+    for (int i = 0; i < total_pixels; i++) {
+        float pixel_val = cpu_output[i] * 255.0f;
+        
+        // Make sure the values stay between 0 and 255
+        if (pixel_val > 255.0f) pixel_val = 255.0f;
+        if (pixel_val < 0.0f) pixel_val = 0.0f;
+        
+        final_image[i] = (unsigned char)pixel_val;
     }
 
-    float sigma_s = 50.0f;
-    float sigma_r = 0.1f;
-    precompute_spatial_kernel(sigma_s);
+    // Save the new image to the hard drive
+    stbi_write_png("filtered_output.png", width, height, 1, final_image, width);
+    printf("Successfully filtered the image!\n");
 
-    // Device allocations and payload transfer
-    float *d_input, *d_output;
-    CUDA_CHECK(cudaMalloc(&d_input, bytes));
-    CUDA_CHECK(cudaMalloc(&d_output, bytes));
-    CUDA_CHECK(cudaMemcpy(d_input, h_input, bytes, cudaMemcpyHostToDevice));
-
-    dim3 blockDim(TILE_DIM, TILE_DIM);
-    dim3 gridDim((width + TILE_DIM - 1) / TILE_DIM, (height + TILE_DIM - 1) / TILE_DIM);
-
-    // Launch Kernel and check for execution failure
-    gpu_bilateral_shared<<<gridDim, blockDim>>>(d_input, d_output, width, height, sigma_r);
-    CUDA_CHECK(cudaPeekAtLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Retrieve payload
-    CUDA_CHECK(cudaMemcpy(h_output, d_output, bytes, cudaMemcpyDeviceToHost));
-
-    // Allocate output image buffer
-    unsigned char* out_img = (unsigned char*)malloc(num_pixels);
-    if (!out_img) {
-        fprintf(stderr, "Fatal: Failed to allocate host memory for output image.\n");
-        // Teardown before exit
-        cudaFree(d_input);
-        cudaFree(d_output);
-        free(h_input);
-        free(h_output);
-        stbi_image_free(raw_img);
-        return -1;
-    }
-
-    // Denormalize safely: Clamp and round to prevent truncation artifacts/overflows
-    for (size_t i = 0; i < num_pixels; i++) {
-        float scaled = h_output[i] * 255.0f;
-        scaled = fmaxf(0.0f, fminf(scaled, 255.0f)); 
-        out_img[i] = (unsigned char)(scaled + 0.5f);
-    }
-
-    // Write to disk
-    if (!stbi_write_png("filtered_output.png", width, height, 1, out_img, width)) {
-        fprintf(stderr, "Fatal: Failed to write output PNG to disk.\n");
-    } else {
-        printf("Filtering complete. Output successfully saved to filtered_output.png\n");
-    }
-
-    // Teardown
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_output));
-    free(h_input);
-    free(h_output);
-    free(out_img);
-    stbi_image_free(raw_img); // STB specific free to prevent allocator mismatch
+    // 6. Clean up memory to prevent leaks
+    cudaFree(gpu_input);
+    cudaFree(gpu_output);
+    free(cpu_input);
+    free(cpu_output);
+    free(final_image);
+    stbi_image_free(raw_img);
 
     return 0;
 }
