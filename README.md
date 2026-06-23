@@ -7,7 +7,6 @@ The point of this project is not the filter itself but the **memory-hierarchy en
 ![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900)
 ![Language](https://img.shields.io/badge/C%2B%2B-CUDA-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
-![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
